@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Build a standalone TypeScript project called **"mini-agents"** that replicates the core agent/subagent architecture from OpenClaw in a simplified, learnable form. It will use the same tech stack (Node.js, TypeScript ESM, Anthropic SDK) but strip away the multi-channel/plugin complexity so you can focus on the agent coordination patterns.
+Build a standalone TypeScript project called **"mini-agents"** that replicates the core agent/subagent architecture from OpenClaw in a simplified, learnable form. It uses the same tech stack (Node.js, TypeScript ESM, Anthropic SDK) and includes a **Telegram bot** as the primary user interface — you chat with your agents through Telegram, and they can spawn subagents to handle subtasks.
 
 ## Tech Stack
 
@@ -11,6 +11,7 @@ Build a standalone TypeScript project called **"mini-agents"** that replicates t
 | Node.js 22+ | Runtime | Same |
 | TypeScript (ESM, strict) | Language | Same |
 | `@anthropic-ai/sdk` | LLM API calls | `@mariozechner/pi-ai` (streamSimple) |
+| `grammy` | Telegram bot framework | Same (OpenClaw uses grammy) |
 | Vitest | Testing | Same |
 | File-based JSON | Session persistence | Same (SessionManager → .jsonl files) |
 | Express | HTTP gateway (optional) | Same (gateway server) |
@@ -42,8 +43,14 @@ mini-agents/
 │   │   ├── registry.ts           # Track active/completed subagent runs
 │   │   ├── depth.ts              # Depth tracking (prevent infinite nesting)
 │   │   └── announce.ts           # Deliver subagent results to parent
+│   ├── telegram/
+│   │   ├── bot.ts                # grammy bot creation & middleware setup
+│   │   ├── handlers.ts           # Message/command handlers
+│   │   ├── context.ts            # Build agent context from Telegram updates
+│   │   ├── delivery.ts           # Send agent responses back to Telegram
+│   │   └── session-key.ts        # Telegram-specific session key builder
 │   └── gateway/
-│       └── server.ts             # HTTP server for agent RPC (optional Phase 4)
+│       └── server.ts             # HTTP server for agent RPC (optional Phase 5)
 ├── agents.json                   # Agent configuration file
 ├── sessions/                     # Session transcript storage (created at runtime)
 ├── package.json
@@ -403,11 +410,320 @@ Two patterns, matching OpenClaw:
 
 ---
 
-### Phase 4: HTTP Gateway (Optional Extension)
+### Phase 4: Telegram Integration — Chat With Your Agents
+
+**Goal:** Receive messages from Telegram, route them to agents, stream responses back. This is how OpenClaw's Telegram channel works, simplified.
+
+#### How OpenClaw Does It (What We're Mirroring)
+
+OpenClaw's Telegram pipeline (`src/telegram/`):
+1. **grammy** bot receives updates (messages, commands, media)
+2. `sequentialize()` middleware ensures messages from the same chat run serially
+3. `buildTelegramMessageContext()` extracts chat type (DM vs group), sender, media, builds session key
+4. `dispatchTelegramMessage()` routes to agent runner with streaming callbacks
+5. `deliverReplies()` sends text/media back, chunked at 4096 chars, with typing indicators
+
+We'll build the same pipeline, just without the advanced features (media groups, dedup watermarks, draft streaming, forum topics).
+
+#### Step 4.1: Install grammy
+
+```bash
+npm install grammy
+```
+
+grammy is the same Telegram bot library OpenClaw uses. It's lightweight, TypeScript-first, and handles polling/webhooks.
+
+#### Step 4.2: Bot creation & middleware (`src/telegram/bot.ts`)
+
+```typescript
+import { Bot, sequentialize } from "grammy";
+
+function createBot(token: string): Bot {
+  const bot = new Bot(token);
+
+  // Sequentialize: same pattern as OpenClaw's getTelegramSequentialKey
+  // Ensures messages from the same chat are processed in order
+  bot.use(sequentialize((ctx) => {
+    return ctx.chat?.id ? String(ctx.chat.id) : undefined;
+  }));
+
+  return bot;
+}
+
+async function startBot(bot: Bot): Promise<void> {
+  // Long polling (simple). OpenClaw also supports webhooks.
+  await bot.start({
+    onStart: () => console.log("Telegram bot started"),
+  });
+}
+```
+
+**Key concept — `sequentialize`:** This is grammy's built-in middleware that does the same thing as OpenClaw's lane system but for incoming Telegram updates. Messages from the same chat are queued and processed one at a time, preventing race conditions on session state.
+
+#### Step 4.3: Telegram session keys (`src/telegram/session-key.ts`)
+
+Build session keys from Telegram chat context (mirrors OpenClaw's `buildAgentPeerSessionKey`):
+
+```typescript
+function buildTelegramSessionKey(params: {
+  agentId: string;
+  chatId: number;
+  chatType: "private" | "group" | "supergroup";
+}): string {
+  const scope = params.chatType === "private"
+    ? `telegram:direct:${params.chatId}`
+    : `telegram:group:${params.chatId}`;
+  return `agent:${params.agentId}:${scope}`;
+}
+
+// Examples:
+// DM:    "agent:main:telegram:direct:123456789"
+// Group: "agent:main:telegram:group:-100987654321"
+```
+
+#### Step 4.4: Message context builder (`src/telegram/context.ts`)
+
+Extract what the agent needs from a Telegram update (simplified version of OpenClaw's `buildTelegramMessageContext`):
+
+```typescript
+type TelegramMessageContext = {
+  sessionKey: string;
+  agentId: string;
+  chatId: number;
+  messageId: number;
+  senderId: number;
+  senderName: string;
+  text: string;
+  isGroup: boolean;
+  wasMentioned: boolean;  // bot was @mentioned (for group filtering)
+};
+
+function buildMessageContext(
+  ctx: GrammyContext,
+  config: AgentsConfig,
+): TelegramMessageContext | null {
+  // 1. Extract chat type, sender, text
+  // 2. Resolve agent (from config bindings or default)
+  // 3. Build session key
+  // 4. Group messages: only respond if @mentioned or replied-to
+  // 5. Return null to skip (access denied, no text, etc.)
+}
+```
+
+#### Step 4.5: Message handlers (`src/telegram/handlers.ts`)
+
+Register grammy handlers that bridge Telegram → agent runner (mirrors OpenClaw's `registerTelegramHandlers`):
+
+```typescript
+function registerHandlers(bot: Bot, config: AgentsConfig, apiKey: string): void {
+  // /start command — welcome message
+  bot.command("start", async (ctx) => {
+    await ctx.reply("Hello! I'm your AI assistant. Send me a message.");
+  });
+
+  // /agents command — list available agents
+  bot.command("agents", async (ctx) => {
+    const list = config.agents.map(a => `- ${a.name} (${a.id})`).join("\n");
+    await ctx.reply(`Available agents:\n${list}`);
+  });
+
+  // /agent <id> — switch which agent handles this chat
+  bot.command("agent", async (ctx) => {
+    // Store agent preference for this chat
+  });
+
+  // All text messages — route to agent
+  bot.on("message:text", async (ctx) => {
+    const msgCtx = buildMessageContext(ctx, config);
+    if (!msgCtx) return;  // skip (not mentioned in group, etc.)
+
+    // Send typing indicator (like OpenClaw does)
+    await ctx.replyWithChatAction("typing");
+
+    // Run agent on its lane
+    const result = await runAgentOnLane({
+      agentId: msgCtx.agentId,
+      sessionId: msgCtx.sessionKey,
+      prompt: msgCtx.text,
+      config,
+      apiKey,
+      // Streaming callback: update typing indicator periodically
+      onPartialReply: () => {
+        void ctx.replyWithChatAction("typing");
+      },
+    });
+
+    // Deliver response back to Telegram
+    await deliverReply(ctx, result);
+  });
+}
+```
+
+#### Step 4.6: Response delivery (`src/telegram/delivery.ts`)
+
+Send agent output back to Telegram (simplified `deliverReplies` from OpenClaw):
+
+```typescript
+async function deliverReply(
+  ctx: GrammyContext,
+  result: AgentResult,
+): Promise<void> {
+  const text = result.text;
+  if (!text) return;
+
+  // Telegram limits messages to 4096 chars
+  // OpenClaw chunks at this limit too (src/telegram/bot/delivery.ts)
+  const MAX_LENGTH = 4096;
+
+  if (text.length <= MAX_LENGTH) {
+    await ctx.reply(text, { parse_mode: "Markdown" });
+    return;
+  }
+
+  // Chunk long responses
+  const chunks = chunkText(text, MAX_LENGTH);
+  for (const chunk of chunks) {
+    await ctx.reply(chunk, { parse_mode: "Markdown" });
+  }
+}
+
+function chunkText(text: string, maxLen: number): string[] {
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+    // Try to break at last newline before limit
+    let breakAt = remaining.lastIndexOf("\n", maxLen);
+    if (breakAt <= 0) breakAt = maxLen;
+    chunks.push(remaining.slice(0, breakAt));
+    remaining = remaining.slice(breakAt).trimStart();
+  }
+  return chunks;
+}
+```
+
+#### Step 4.7: Subagent results in Telegram
+
+When a subagent finishes, its result should appear in the Telegram chat (not just in the session store). Extend `announceSubagentResult` to also send a Telegram message:
+
+```typescript
+// In announce.ts, add a callback for delivery
+type AnnounceCallback = (params: {
+  parentSessionKey: string;
+  text: string;
+}) => Promise<void>;
+
+// The Telegram handler registers this callback:
+onSubagentAnnounce(async ({ parentSessionKey, text }) => {
+  const chatId = extractChatIdFromSessionKey(parentSessionKey);
+  if (chatId) {
+    await bot.api.sendMessage(chatId, text, { parse_mode: "Markdown" });
+  }
+});
+```
+
+#### Step 4.8: Config — Telegram section
+
+Add Telegram config to `agents.json`:
+
+```json
+{
+  "defaultAgentId": "main",
+  "telegram": {
+    "token": "BOT_TOKEN_HERE",
+    "allowedUsers": [123456789],
+    "groupBehavior": "mention-only"
+  },
+  "agents": [...]
+}
+```
+
+| Field | Purpose | OpenClaw equivalent |
+|-------|---------|---------------------|
+| `token` | Telegram bot token from @BotFather | `config.telegram.token` |
+| `allowedUsers` | Whitelist of Telegram user IDs | `config.telegram.allowFrom` |
+| `groupBehavior` | "mention-only" or "all" | `config.telegram.groupAllowFrom` |
+
+#### Step 4.9: CLI integration
+
+Update the CLI to support starting the Telegram bot:
+
+```bash
+# Start Telegram bot (long polling)
+npx mini-agents telegram
+
+# Start Telegram bot with explicit token
+npx mini-agents telegram --token BOT_TOKEN
+
+# Still works: CLI chat mode
+npx mini-agents chat "Hello"
+```
+
+#### Step 4.10: End-to-end flow diagram
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Telegram User sends: "Research TypeScript 5.9 new features"  │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────┐
+│ grammy bot.on("message:text")                                │
+│   → sequentialize ensures serial per-chat                    │
+│   → buildMessageContext() extracts sender, chat, text        │
+│   → ctx.replyWithChatAction("typing")                        │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────┐
+│ runAgentOnLane()                                             │
+│   → Lane: "session:agent:main:telegram:direct:123456"        │
+│   → Load session from disk                                   │
+│   → Build system prompt (full mode)                          │
+│   → Call Anthropic API                                       │
+│   → Agent decides to use spawn_subagent tool                 │
+│       task: "Search for TypeScript 5.9 release notes"        │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+              ▼                         ▼
+┌─────────────────────────┐  ┌──────────────────────────────┐
+│ Parent agent responds:  │  │ Subagent spawned on new lane │
+│ "I've dispatched a      │  │ Lane: "session:agent:main:   │
+│  research subagent..."  │  │  subagent:abc123"            │
+│                         │  │ → Runs with minimal prompt   │
+│ → deliverReply() sends  │  │ → Uses web_search tool       │
+│   to Telegram           │  │ → Completes independently    │
+└─────────────────────────┘  └──────────────┬───────────────┘
+                                            │
+                                            ▼
+                              ┌──────────────────────────────┐
+                              │ announceSubagentResult()     │
+                              │ → Appends to parent session  │
+                              │ → Calls onSubagentAnnounce   │
+                              │ → bot.api.sendMessage()      │
+                              │   sends result to Telegram   │
+                              └──────────────────────────────┘
+```
+
+#### Step 4.11: Tests
+- Mock grammy bot, verify message → agent → reply pipeline
+- Verify session keys are correct for DMs vs groups
+- Verify 4096-char chunking
+- Verify group mention filtering
+- Verify subagent results appear in Telegram
+
+---
+
+### Phase 5: HTTP Gateway (Optional Extension)
 
 **Goal:** Expose the agent system over HTTP, so agents communicate via RPC (like OpenClaw's gateway).
 
-#### Step 4.1: Express gateway server (`src/gateway/server.ts`)
+#### Step 5.1: Express gateway server (`src/gateway/server.ts`)
 ```typescript
 // POST /agent       — Run an agent turn
 // POST /agent/wait  — Wait for a running agent to finish
@@ -416,13 +732,13 @@ Two patterns, matching OpenClaw:
 // POST /subagent/kill — Terminate a subagent
 ```
 
-#### Step 4.2: Refactor subagent spawn to use gateway RPC
+#### Step 5.2: Refactor subagent spawn to use gateway RPC
 Instead of directly calling `runAgent()`, subagents call the gateway:
 ```typescript
 // Before (Phase 3): direct function call
 await runAgent({ ... });
 
-// After (Phase 4): HTTP RPC (matches OpenClaw's callGateway pattern)
+// After (Phase 5): HTTP RPC (matches OpenClaw's callGateway pattern)
 await fetch("http://localhost:3000/agent", {
   method: "POST",
   body: JSON.stringify({ agentId, sessionId, prompt }),
@@ -454,7 +770,14 @@ This decouples spawning from execution, exactly like OpenClaw does.
 | 3.5-3.6 | Subagent tools | 3.3, 3.4 |
 | 3.7 | Wait mechanism | 3.3 |
 | 3.8 | Phase 3 tests | 3.5 |
-| 4.1-4.2 | HTTP gateway | 3.5 |
+| 4.1-4.2 | grammy bot + middleware | 1.1 |
+| 4.3-4.4 | Telegram session keys + context | 1.5, 4.1 |
+| 4.5 | Telegram message handlers | 4.4, 2.1, 1.10 |
+| 4.6 | Response delivery | 4.5 |
+| 4.7 | Subagent announce → Telegram | 3.4, 4.6 |
+| 4.8-4.9 | Telegram config + CLI command | 4.5 |
+| 4.10-4.11 | E2E flow + tests | 4.7 |
+| 5.1-5.2 | HTTP gateway (optional) | 3.5 |
 
 ## How to Run
 
@@ -468,17 +791,17 @@ npm install
 # Build
 npm run build
 
-# Interactive chat with default agent
+# --- CLI mode (Phase 1) ---
 npx mini-agents chat "Hello, what can you do?"
-
-# Chat with specific agent
 npx mini-agents chat --agent researcher "Find info about TypeScript 5.9"
-
-# List agents
 npx mini-agents agents list
-
-# List sessions
 npx mini-agents sessions list
+
+# --- Telegram mode (Phase 4) ---
+# 1. Create a bot via @BotFather on Telegram, get the token
+# 2. Add token to agents.json or pass via flag
+npx mini-agents telegram --token "123456:ABC-DEF..."
+# 3. Open Telegram, message your bot, agents respond!
 
 # Run tests
 npm test
@@ -489,6 +812,11 @@ npm test
 ```json
 {
   "defaultAgentId": "main",
+  "telegram": {
+    "token": "YOUR_BOT_TOKEN",
+    "allowedUsers": [123456789],
+    "groupBehavior": "mention-only"
+  },
   "agents": [
     {
       "id": "main",
@@ -523,6 +851,9 @@ npm test
 | `subagent-announce.ts` (1025 LOC) | `announce.ts` (~50 LOC) | Simple message append, no retry logic |
 | `system-prompt.ts` (705 LOC) | `system-prompt.ts` (~80 LOC) | Two modes, no skills/memory/sandbox sections |
 | `openclaw-tools.ts` (50+ tools) | `tools.ts` (5 tools) | Just file I/O, search, and subagent management |
-| Channel bindings + routing | CLI only | No multi-channel complexity |
+| `grammy` + `sequentialize` | `grammy` + `sequentialize` | Same library, fewer handlers |
+| `buildTelegramMessageContext` (400 LOC) | `context.ts` (~60 LOC) | No media groups, dedup, forum topics |
+| `deliverReplies` (250 LOC) | `delivery.ts` (~40 LOC) | Text only, no media/voice/inline buttons |
+| Channel bindings + routing | Telegram + CLI only | No Discord/Slack/Signal/WhatsApp |
 | Plugin system + extensions | None | Out of scope |
 | Auth profiles + model fallback | Single API key | No fallback chain |
